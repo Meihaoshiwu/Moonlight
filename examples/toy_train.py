@@ -1,7 +1,10 @@
 import os
 import math
 import torch
+import gc
+import datetime
 from loguru import logger
+from contextlib import contextmanager
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
@@ -12,6 +15,18 @@ from transformers import (
 )
 from tqdm import tqdm
 
+# === 自定义存储路径 ===
+MODEL_CACHE = "/home/ma-user/sfs_turbo/sudetong/models"  # 模型和tokenizer缓存路径
+DATASET_CACHE = "/home/ma-user/sfs_turbo/sudetong/datasets"  # 数据集缓存路径
+TOKENIZED_CACHE = "/home/ma-user/sfs_turbo/sudetong/tokenized_data"  # 分词后数据缓存路径
+
+# 创建目录
+os.makedirs(MODEL_CACHE, exist_ok=True)
+os.makedirs(DATASET_CACHE, exist_ok=True)
+os.makedirs(TOKENIZED_CACHE, exist_ok=True)
+
+def get_timestamp():
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 class MoonDataset(Dataset):
     def __init__(self, dataset_name, dataset, tokenizer, max_length=512):
@@ -21,16 +36,20 @@ class MoonDataset(Dataset):
         self.texts = dataset["train"]["text"]
         self.max_length = max_length
         self.tokens = []
+        # === 分词后数据缓存路径 ===
+        self.cache_file = os.path.join(TOKENIZED_CACHE, f"{self.dataset_name}.bin")
         self._tokenize_texts()
 
     def _tokenize_texts(self):
-        if os.path.exists(f"{self.dataset_name}.bin"):
-            self.tokens = torch.load(f"{self.dataset_name}.bin")
+        if os.path.exists(self.cache_file):
+            logger.info(f"Loading tokenized data from {self.cache_file}")
+            self.tokens = torch.load(self.cache_file, weights_only=True)
         else:
+            logger.info(f"Tokenizing texts and saving to {self.cache_file}")
             for text in tqdm(self.texts, desc="Tokenizing texts"):
                 encoded = self.tokenizer.encode(text, add_special_tokens=True)
                 self.tokens.extend(encoded)
-            torch.save(self.tokens, f"{self.dataset_name}.bin")
+            torch.save(self.tokens, self.cache_file)
 
     def __len__(self):
         return len(self.tokens) // self.max_length
@@ -75,6 +94,80 @@ def zeropower_via_newtonschulz5(G, steps):
         X = X.T
     return X
 
+def step_default(G, steps):
+    return zeropower_via_newtonschulz5(G, steps)
+
+def process_block(blocked_matrix, steps):
+    if torch.norm(blocked_matrix) > 1e-7:
+        orthogonalized_block = zeropower_via_newtonschulz5(blocked_matrix, steps)
+        return orthogonalized_block
+    else:
+        return blocked_matrix
+
+def step_column_block(G, steps):
+    """
+    将矩阵的列分成4块，每块独立进行正交化处理
+    """
+    result = torch.zeros_like(G) # 用于保存结果
+    cols = G.shape[1]  # 总列数
+    block_size = cols // 4  # 每块的列数
+    
+    # 处理前3个完整的块
+    for i in range(3):
+        start_col = i * block_size
+        end_col = (i + 1) * block_size
+        column_block = G[:, start_col:end_col] # 取所有行，[start_col,end_col)列
+
+        result[:, start_col:end_col] = process_block(column_block, steps)
+    
+    # 处理最后一块（可能包含剩余的列）
+    start_col = 3 * block_size
+    last_block = G[:, start_col:]
+    result[:, start_col:] = process_block(last_block, steps)
+    
+    return result
+
+def step_row_block(G, steps):
+    """
+    将矩阵的行分成4块，每块独立进行正交化处理
+    """
+    result = torch.zeros_like(G)
+    rows = G.shape[0]  # 总行数
+    block_size = rows // 4  # 每块的行数
+    
+    # 处理前3个完整的块
+    for i in range(3):
+        start_row = i * block_size
+        end_row = (i + 1) * block_size
+        row_block = G[start_row:end_row, :]
+        result[start_row:end_row, :] = process_block(row_block, steps)
+    
+    # 处理最后一块（可能包含剩余的行）
+    start_row = 3 * block_size
+    last_block = G[start_row:, :]
+    result[start_row:, :] = process_block(last_block, steps)
+    
+    return result
+
+def step_quadrant_block(G, steps):
+    """
+    将矩阵分成2x2的分成四块
+    """
+    result = torch.zeros_like(G)
+    
+    rowidx = G.shape[0]//2
+    colidx = G.shape[1]//2
+
+    G11 = G[:rowidx, :colidx]
+    result[:rowidx, :colidx] = process_block(G11, steps)
+    G12 = G[:rowidx, colidx:]
+    result[:rowidx, colidx:] = process_block(G12, steps)
+    G21 = G[rowidx:, :colidx]
+    result[rowidx:, :colidx] = process_block(G21, steps)
+    G22 = G[rowidx:, colidx:]
+    result[rowidx:, colidx:] = process_block(G22, steps)
+    
+    return result
 
 class Muon(torch.optim.Optimizer):
     """
@@ -105,6 +198,7 @@ class Muon(torch.optim.Optimizer):
 
     def __init__(
         self,
+        step_func:callable,
         lr=1e-3,
         wd=0.1,
         muon_params=None,
@@ -126,6 +220,7 @@ class Muon(torch.optim.Optimizer):
             adamw_eps=adamw_eps,
         )
 
+        self.step_func = step_func
         params = list(muon_params)
         adamw_params = list(adamw_params) if adamw_params is not None else []
         params.extend(adamw_params)
@@ -191,7 +286,7 @@ class Muon(torch.optim.Optimizer):
                     g = g.add(buf, alpha=momentum)
                 else:
                     g = buf
-                u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                u = self.step_func(g, steps=group["ns_steps"])
 
                 # scale update
                 adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
@@ -239,19 +334,31 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-def get_model_and_dataloader(model_name, dataset_name, hidden_size):
+def get_model_and_dataloader(model_name, dataset_name, hidden_size, max_position_embeddings=2048, max_length=512, batch_size=32):
     name2path = {
         "openwebtext-100k": "Elriggs/openwebtext-100k",
+        "openwebtext": "Skylion007/openwebtext",
+        "wikitext-103": "wikitext",  # 约550MB
     }
-    train_dataset = load_dataset(name2path[dataset_name], trust_remote_code=True)
+    print(f"dataset_name = {dataset_name}, name2path[dataset_name] = {name2path[dataset_name]}")
+    train_dataset = load_dataset(
+        name2path[dataset_name], 
+        cache_dir=DATASET_CACHE,  # 指定数据集缓存路径
+    )
     if model_name == "qwen":
         tokenizer = Qwen2Tokenizer.from_pretrained(
-            "Qwen/Qwen2.5-0.5B", trust_remote_code=True
+            "Qwen/Qwen2.5-0.5B", 
+            cache_dir=MODEL_CACHE,  # 指定模型文件缓存路径
+        )
+    elif model_name == "qwen_small":
+        tokenizer = Qwen2Tokenizer.from_pretrained(
+            "Qwen/Qwen2.5-0.5B", 
+            cache_dir=MODEL_CACHE,  # 指定模型文件缓存路径
         )
     else:
         assert 0, f"model {model_name} not supported"
-    train_dataset = MoonDataset(dataset_name, train_dataset, tokenizer)
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+    train_dataset = MoonDataset(dataset_name, train_dataset, tokenizer, max_length=max_length)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
     if model_name == "qwen":
         config = Qwen2Config(
@@ -262,7 +369,7 @@ def get_model_and_dataloader(model_name, dataset_name, hidden_size):
             hidden_size=hidden_size,
             initializer_range=0.02,
             intermediate_size=4864,
-            max_position_embeddings=513,
+            max_position_embeddings=max_position_embeddings,
             max_window_layers=12,
             model_type="qwen2",
             num_attention_heads=16,
@@ -279,12 +386,38 @@ def get_model_and_dataloader(model_name, dataset_name, hidden_size):
             vocab_size=151936,
         )
         model = Qwen2ForCausalLM(config)
+    elif model_name == "qwen_small":
+        config = Qwen2Config(
+            attention_dropout=0.0,
+            bos_token_id=151643,
+            eos_token_id=151643,
+            hidden_act="silu",
+            hidden_size=hidden_size,
+            initializer_range=0.02,
+            intermediate_size=hidden_size*4,
+            max_position_embeddings=max_position_embeddings,
+            max_window_layers=12,
+            model_type="qwen2",
+            num_attention_heads=8,
+            num_hidden_layers=8,
+            num_key_value_heads=8,
+            rms_norm_eps=1e-06,
+            rope_theta=1000000.0,
+            sliding_window=1024,
+            tie_word_embeddings=True,
+            torch_dtype="bfloat16",
+            use_cache=True,
+            use_mrope=False,
+            use_sliding_window=False,
+            vocab_size=151936,
+        )
+        model = Qwen2ForCausalLM(config)
     else:
         assert 0, f"model {model_name} not supported"
     return model, train_loader
 
 
-def get_optimizer(optimizer_name, model, lr=1e-3, wd=0.1):
+def get_optimizer(step_func:callable, optimizer_name, model, lr=1e-3, wd=0.1):
     if optimizer_name == "adamw":
         return torch.optim.AdamW(
             model.parameters(), lr=lr, weight_decay=wd, betas=(0.9, 0.95)
@@ -304,6 +437,7 @@ def get_optimizer(optimizer_name, model, lr=1e-3, wd=0.1):
         ]
 
         return Muon(
+            step_func,
             lr=lr,
             wd=wd,
             muon_params=muon_params,
@@ -312,48 +446,280 @@ def get_optimizer(optimizer_name, model, lr=1e-3, wd=0.1):
     else:
         assert 0, "optimizer not supported"
 
+# Python参数顺序规则,没有默认值参数要放在前
+# 没有默认值的：位置参数  有默认值的：关键字参数
+class ExperimentConfig():
+    def __init__(
+        self,
+        step_func_name,
+        step_func:callable,
+        log_file_path,
+        model_name="qwen",
+        dataset_name="openwebtext",
+        optimizer_name="muon",
+        batch_size=32,
+        hidden_size=512,
+        max_position_embeddings=2048,
+        max_length=512,
+        loss_threshold=1.0,
+        max_epochs=5,
+        lr=1e-3,
+        wd=0.1, #AdamW使用
+    ):
+        self.step_func_name = step_func_name
+        self.step_func=step_func
+        self.log_file_path = log_file_path
+        self.model_name = model_name
+        self.dataset_name = dataset_name
+        self.optimizer_name = optimizer_name
+        self.batch_size = batch_size
+        self.hidden_size = hidden_size
+        self.max_position_embeddings = max_position_embeddings
+        self.max_length = max_length
+        self.loss_threshold = loss_threshold
+        self.max_epochs = max_epochs
+        self.lr = lr
+        self.wd = wd
+    
+    def __repr__(self):
+        """便于打印配置信息"""
+        return (f"ExperimentConfig(step_func_name={self.step_func_name}, "
+                f"model_name={self.model_name}, dataset_name={self.dataset_name}, "
+                f"hidden_size={self.hidden_size}, loss_threshold={self.loss_threshold}, "
+                f"max_epochs={self.max_epochs}, lr={self.lr}, wd={self.wd})")       
 
-if __name__ == "__main__":
+class ExperimentResources:
+    """实验资源容器"""
+    def __init__(
+            self,
+            model,
+            train_loader,
+            optimizer,
+            device,
+            lr_scheduler):
+        self.model = model
+        self.train_loader = train_loader
+        self.optimizer = optimizer
+        self.device = device
+        self.lr_scheduler = lr_scheduler
+
+# 实验函数配置
+STEP_MAP = {
+    "step_func_default": {"loss_threshold": 1.0, "step_func": step_default},
+    "step_func_column_block": {"loss_threshold": 1.0, "step_func": step_column_block}, 
+    "step_func_row_block": {"loss_threshold": 1.0, "step_func": step_row_block},
+    "step_func_quadrant_block": {"loss_threshold": 1.0, "step_func": step_quadrant_block}
+}
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters())
+
+@contextmanager
+def experiment_manager(experiment_config: ExperimentConfig):
+    """管理GPU、数据集、模型资源，管理日志打印"""
+    step_func_name = experiment_config.step_func_name
+    optimizer_name = experiment_config.optimizer_name
+    loss_threshold = experiment_config.loss_threshold
+    log_file_path = experiment_config.log_file_path
+    lr = experiment_config.lr
+    model_name = experiment_config.model_name
+    dataset_name = experiment_config.dataset_name
+    max_epochs = experiment_config.max_epochs
+    max_position_embeddings=experiment_config.max_position_embeddings
+    max_length = experiment_config.max_length
+  
+    # 控制日志范围 logger.add新建一个sink，后续的info都会打印在这里
+    timestamp = get_timestamp()
+    sink_id = logger.add(f"{log_file_path}/{timestamp}_train_{step_func_name}_{dataset_name}_{model_name}_{optimizer_name}_lr{lr}.log", mode="w")
+    # 初始化所有资源
+    model, train_loader = get_model_and_dataloader(
+        model_name, dataset_name, experiment_config.hidden_size, max_position_embeddings=max_position_embeddings, max_length=max_length
+    )
+
+    total_params = count_parameters(model)
+    logger.info(f"🚀 开始实验: {optimizer_name}_{step_func_name}")
+    logger.info(f"目标损失阈值: {loss_threshold}, 最大epoch数: {max_epochs}, 总参数量: {total_params}"
+                "max_position_embeddings: {max_position_embeddings}, max_length:{max_length}")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    
+    optimizer = get_optimizer(
+        STEP_MAP.get(step_func_name).get("step_func"), optimizer_name, model, lr=lr, wd=experiment_config.wd
+    )
+    
+    num_training_steps = len(train_loader) * max_epochs
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=min(100, num_training_steps // 10),
+        num_training_steps=num_training_steps,
+        num_cycles=0.5,
+    )
+    
+    # 封装资源
+    resources = ExperimentResources(
+        model=model,
+        train_loader=train_loader,
+        optimizer=optimizer,
+        device=device,
+        lr_scheduler=lr_scheduler
+    )
+    
+    try:
+        logger.info("✅ 资源初始化完成")
+        yield resources  # 在这里交出资源控制权
+        
+    finally:
+        # 清理资源（无论正常还是异常都会执行）
+        logger.info("🧹 清理实验资源...")
+        del resources.model
+        del resources.train_loader
+        del resources.optimizer
+        del resources.lr_scheduler
+        
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("✅ 资源清理完成")
+        logger.remove(sink_id)
+
+def run_experiment(experiment_config: ExperimentConfig):
+    """运行单个实验，直到损失低于阈值或达到最大epoch数"""
+    with experiment_manager(experiment_config) as resources:
+        model = resources.model
+        train_loader = resources.train_loader
+        optimizer = resources.optimizer
+        device = resources.device
+        lr_scheduler = resources.lr_scheduler
+        step_func_name = experiment_config.step_func_name
+        model.train()
+        losses = []
+        
+        # 添加token计数器
+        total_tokens_trained = 0
+        batch_size = experiment_config.batch_size
+        max_length = experiment_config.max_length
+        
+        for epoch in range(experiment_config.max_epochs):
+            epoch_losses = []
+            
+            # 创建epoch进度条
+            epoch_pbar = tqdm(
+                total=len(train_loader),
+                desc=f"Epoch {epoch+1}/{experiment_config.max_epochs} - {step_func_name}",
+                unit="batch",
+                ncols=100
+            )
+            
+            for step, batch in enumerate(train_loader):
+                optimizer.zero_grad()
+                batch = batch.to(device)
+                input_ids = batch
+                outputs = model(input_ids=input_ids, labels=input_ids)
+                loss = outputs.loss
+                loss.backward()
+                optimizer.step()
+                lr_scheduler.step()
+                
+                current_loss = loss.item()
+                epoch_losses.append(current_loss)
+                
+                # 计算当前batch的token数并累加
+                tokens_this_batch = batch_size * max_length
+                total_tokens_trained += tokens_this_batch
+                
+                # 更新进度条描述
+                epoch_pbar.set_postfix({
+                    'loss': f'{current_loss:.4f}',
+                    'tokens': f'{total_tokens_trained:,}',
+                    'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
+                })
+                epoch_pbar.update(1)
+                
+                # 记录详细日志 - 改为token数对应loss
+                if step % 100 == 0:
+                    logger.info(
+                        f"StepFunc: {step_func_name} Epoch: {epoch} Step: {step} Tokens: {total_tokens_trained} "
+                        f"LR: {optimizer.param_groups[0]['lr']:.6f} Loss: {current_loss:.4f}"
+                    )
+            
+            epoch_pbar.close()
+            
+            # 计算epoch平均损失
+            avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
+            losses.append(avg_epoch_loss)
+            logger.info(f"📊 {step_func_name} - Epoch {epoch} 平均损失: {avg_epoch_loss:.4f}, 累计token数: {total_tokens_trained}")
+            
+            # 检查是否达到停止条件
+            if avg_epoch_loss < experiment_config.loss_threshold:
+                logger.info(f"🎯 {step_func_name} 已达到目标损失 {avg_epoch_loss:.4f} < {experiment_config.loss_threshold}, 停止训练")
+                break
+        final_loss = losses[-1] if losses else float('inf')
+        return final_loss, losses
+
+def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="qwen")
-    parser.add_argument("--optimizer", type=str, default="adamw")
+    parser.add_argument("--step_func_name", type=str, default="default")
+    parser.add_argument("--model", type=str, default="qwen_small")
+    parser.add_argument("--optimizer", type=str, default="muon")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--wd", type=float, default=0.1)
     parser.add_argument("--dataset", type=str, default="openwebtext-100k")
-    parser.add_argument("--hidden_size", type=int, default=1024)
+    parser.add_argument("--hidden_size", type=int, default=512) # 一个词使用多长的向量来表示（词向量维数）
+    parser.add_argument("--max_position_embeddings", type=int, default=2048) # 最长给多少个词编码
+    parser.add_argument("--max_length", type=int, default=256) # 每一批样本读入多少个token（即词向量）
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--loss_threshold", type=float, default=3.0)
+    parser.add_argument("--max_epochs", type=int, default=10)
     args = parser.parse_args()
-    logger.add(f"logs/train_{args.model}_{args.optimizer}_lr{args.lr}.log")
 
-    model, train_loader = get_model_and_dataloader(
-        args.model, args.dataset, args.hidden_size
-    )
-    optimizer = get_optimizer(
-        args.optimizer, model, lr=args.lr
+    timestamp = get_timestamp()
+    base_log_path = "/home/ma-user/sfs_turbo/sudetong/results/logs/MuonBlockMatrix"
+    experiment_dir = f"{base_log_path}/experiment_{timestamp}"
+
+    experiment_config = ExperimentConfig(
+        step_func_name="default",
+        step_func=step_default,
+        log_file_path=experiment_dir,
+        model_name=args.model,
+        dataset_name=args.dataset,
+        optimizer_name=args.optimizer,
+        batch_size=args.batch_size,
+        hidden_size=args.hidden_size,
+        loss_threshold=args.loss_threshold,
+        max_epochs=args.max_epochs,
+        lr=args.lr,
+        wd=args.wd
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    print(f"🧪 开始自动化实验序列")
+    print(f"使用模型缓存: {MODEL_CACHE}")
+    print(f"使用数据集缓存: {DATASET_CACHE}")
+    print(f"使用分词缓存: {TOKENIZED_CACHE}")
+    
+    results = {}
+    for i, (func_name, config_dict) in enumerate(STEP_MAP.items()):
+        # 运行实验
+        experiment_config.step_func_name = func_name
+        experiment_config.step_func = config_dict.get("step_func")
+        final_loss, all_losses = run_experiment(experiment_config)
+        
+        # 保存结果
+        results[func_name] = {
+            'final_loss': final_loss,
+            'all_losses': all_losses,
+            'converged': final_loss < experiment_config.loss_threshold
+        }
+        
+        # 为下一个实验等待一下，确保资源释放
+        import time
+        time.sleep(5)
+    
+    for exp_name, result in results.items():
+        status = "✅ 收敛" if result['converged'] else "❌ 未收敛"
+        print(f"{exp_name}: 最终损失 = {result['final_loss']:.4f} {status}")
 
-    model.train()
-    epoch = 1
-    lr_scheduler = get_cosine_schedule_with_warmup(
-        optimizer=optimizer,
-        num_warmup_steps=100,
-        num_training_steps=len(train_loader) * epoch,
-        num_cycles=0.5,
-    )
-    for epoch in range(epoch):
-        for step, batch in enumerate(train_loader):
-            batch = batch.to(device)
-            input_ids = batch
-            outputs = model(input_ids=input_ids, labels=input_ids)
-            loss = outputs.loss
-            loss.backward()
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad()
-            logger.info(
-                f"Epoch: {epoch} Step: {step} LR: {optimizer.param_groups[0]['lr']} Training loss: {loss.item()}"
-            )
+if __name__ == "__main__":
+    main()

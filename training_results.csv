@@ -1,0 +1,6 @@
+﻿实验名称,初始损失,最终损失,总训练Token数,改善百分比
+train_step_func_row_block_openwebtext-100k_qwen_muon_lr0.001,12.1482,10.5930,"311,296",12.8%
+train_step_func_column_block_openwebtext-100k_qwen_muon_lr0.001,12.1359,10.6247,"311,296",12.5%
+train_step_func_quadrant_block_openwebtext-100k_qwen_muon_lr0.001,12.1314,10.6424,"311,296",12.3%
+experiment_sequence,12.1540,10.6424,"311,296",12.4%
+train_step_func_default_openwebtext-100k_qwen_muon_lr0.001,12.1540,11.1182,"311,296",8.5%
