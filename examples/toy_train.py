@@ -16,14 +16,18 @@ from transformers import (
 from tqdm import tqdm
 
 # === 自定义存储路径 ===
-MODEL_CACHE = "/home/ma-user/sfs_turbo/sudetong/models"  # 模型和tokenizer缓存路径
-DATASET_CACHE = "/home/ma-user/sfs_turbo/sudetong/datasets"  # 数据集缓存路径
-TOKENIZED_CACHE = "/home/ma-user/sfs_turbo/sudetong/tokenized_data"  # 分词后数据缓存路径
+MUON_BLOCK_MATRIX_EXPERIMENT_DIR = os.getenv("MUON_BLOCK_MATRIX_EXPERIMENT_DIR")
+# === 基于环境变量的存储路径 ===
+MODEL_CACHE = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "Models")
+DATASET_CACHE = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "Datasets") 
+TOKENIZED_CACHE = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "TokenizedData")
+RESULTS_BASE = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "Results")
 
 # 创建目录
 os.makedirs(MODEL_CACHE, exist_ok=True)
 os.makedirs(DATASET_CACHE, exist_ok=True)
 os.makedirs(TOKENIZED_CACHE, exist_ok=True)
+os.makedirs(RESULTS_BASE, exist_ok=True)
 
 def get_timestamp():
     return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -530,7 +534,8 @@ def experiment_manager(experiment_config: ExperimentConfig):
   
     # 控制日志范围 logger.add新建一个sink，后续的info都会打印在这里
     timestamp = get_timestamp()
-    sink_id = logger.add(f"{log_file_path}/{timestamp}_train_{step_func_name}_{dataset_name}_{model_name}_{optimizer_name}_lr{lr}.log", mode="w")
+    logger.remove()
+    sink_id = logger.add(f"{log_file_path}/{timestamp}_train_{step_func_name}_{dataset_name}_{model_name}_{optimizer_name}_lr{lr}.log", mode="w", level="INFO")
     # 初始化所有资源
     model, train_loader = get_model_and_dataloader(
         model_name, dataset_name, experiment_config.hidden_size, max_position_embeddings=max_position_embeddings, max_length=max_length
@@ -676,7 +681,7 @@ def main():
     args = parser.parse_args()
 
     timestamp = get_timestamp()
-    base_log_path = "/home/ma-user/sfs_turbo/sudetong/results/logs/MuonBlockMatrix"
+    base_log_path = os.path.join(RESULTS_BASE, "Logs/MuonBlockMatrix")
     experiment_dir = f"{base_log_path}/experiment_{timestamp}"
 
     experiment_config = ExperimentConfig(
