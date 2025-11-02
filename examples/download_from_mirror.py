@@ -1,7 +1,13 @@
 import os
 # 修改为镜像源
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-DATASET_CACHE = "/home/ma-user/sfs_turbo/sudetong/datasets/download"
+# === 自定义存储路径 ===
+MUON_BLOCK_MATRIX_EXPERIMENT_DIR = os.getenv("MUON_BLOCK_MATRIX_EXPERIMENT_DIR")
+# === 基于环境变量的存储路径 ===
+MODEL_CACHE = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "Models")
+DATASET_CACHE = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "Datasets") 
+TOKENIZED_CACHE = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "TokenizedData")
+
 from huggingface_hub import snapshot_download
 
 local_dir = 'path_to_down'

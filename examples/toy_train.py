@@ -1,12 +1,18 @@
 import os
 import math
-import torch
 import gc
 import datetime
 from loguru import logger
 from contextlib import contextmanager
 from datasets import load_dataset
+
+import torch
 from torch.utils.data import DataLoader, Dataset
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
 from transformers import (
     Qwen2Config,
     Qwen2ForCausalLM,
@@ -19,15 +25,21 @@ from tqdm import tqdm
 MUON_BLOCK_MATRIX_EXPERIMENT_DIR = os.getenv("MUON_BLOCK_MATRIX_EXPERIMENT_DIR")
 # === 基于环境变量的存储路径 ===
 MODEL_CACHE = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "Models")
-DATASET_CACHE = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "Datasets") 
+DATASET_PATH = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "Datasets") 
 TOKENIZED_CACHE = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "TokenizedData")
 RESULTS_BASE = os.path.join(MUON_BLOCK_MATRIX_EXPERIMENT_DIR, "Results")
+OPENWEBTEXT_EXTRACTED = os.path.join(DATASET_PATH, "openwebtext_extracted")
+DATASET_CACHE = os.path.join(DATASET_PATH, "cache")
+DATASET_DOWNLOAD = os.path.join(DATASET_PATH, "download")
 
 # 创建目录
 os.makedirs(MODEL_CACHE, exist_ok=True)
 os.makedirs(DATASET_CACHE, exist_ok=True)
 os.makedirs(TOKENIZED_CACHE, exist_ok=True)
 os.makedirs(RESULTS_BASE, exist_ok=True)
+os.makedirs(OPENWEBTEXT_EXTRACTED, exist_ok=True)
+os.makedirs(DATASET_CACHE, exist_ok=True)
+os.makedirs(DATASET_DOWNLOAD, exist_ok=True)
 
 def get_timestamp():
     return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -338,17 +350,27 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-def get_model_and_dataloader(model_name, dataset_name, hidden_size, max_position_embeddings=2048, max_length=512, batch_size=32):
+def get_model_and_dataloader(model_name, dataset_name, hidden_size, max_position_embeddings=2048,
+                            max_length=512, batch_size=32, rank=0, world_size=1):
     name2path = {
         "openwebtext-100k": "Elriggs/openwebtext-100k",
         "openwebtext": "Skylion007/openwebtext",
         "wikitext-103": "wikitext",  # 约550MB
+        "openwebtext-local_txt": "local_txt"
     }
     print(f"dataset_name = {dataset_name}, name2path[dataset_name] = {name2path[dataset_name]}")
-    train_dataset = load_dataset(
-        name2path[dataset_name], 
-        cache_dir=DATASET_CACHE,  # 指定数据集缓存路径
-    )
+
+    # 修改：从本地txt文件加载数据集
+    if dataset_name == "openwebtext-local_txt":
+        train_dataset = load_dataset("text", data_files=f"{OPENWEBTEXT_EXTRACTED}/*.txt", streaming=True,
+            cache_dir=DATASET_CACHE,  # 指定数据集缓存路径
+        )
+    else:
+        train_dataset = load_dataset(
+            name2path[dataset_name], 
+            cache_dir=DATASET_CACHE,  # 指定数据集缓存路径
+        )
+
     if model_name == "qwen":
         tokenizer = Qwen2Tokenizer.from_pretrained(
             "Qwen/Qwen2.5-0.5B", 
@@ -361,8 +383,16 @@ def get_model_and_dataloader(model_name, dataset_name, hidden_size, max_position
         )
     else:
         assert 0, f"model {model_name} not supported"
+
     train_dataset = MoonDataset(dataset_name, train_dataset, tokenizer, max_length=max_length)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    # DDP修改：使用DistributedSampler
+    sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        sampler=sampler,
+        shuffle=(sampler is None)  # 单GPU时使用shuffle
+    )
 
     if model_name == "qwen":
         config = Qwen2Config(
@@ -418,7 +448,7 @@ def get_model_and_dataloader(model_name, dataset_name, hidden_size, max_position
         model = Qwen2ForCausalLM(config)
     else:
         assert 0, f"model {model_name} not supported"
-    return model, train_loader
+    return model, train_loader, sampler
 
 
 def get_optimizer(step_func:callable, optimizer_name, model, lr=1e-3, wd=0.1):
@@ -469,7 +499,8 @@ class ExperimentConfig():
         max_epochs=5,
         lr=1e-3,
         wd=0.1, #AdamW使用
-    ):
+        sampler=None
+        ):
         self.step_func_name = step_func_name
         self.step_func=step_func
         self.log_file_path = log_file_path
@@ -484,6 +515,7 @@ class ExperimentConfig():
         self.max_epochs = max_epochs
         self.lr = lr
         self.wd = wd
+        self.sampler = sampler
     
     def __repr__(self):
         """便于打印配置信息"""
@@ -500,12 +532,18 @@ class ExperimentResources:
             train_loader,
             optimizer,
             device,
-            lr_scheduler):
+            lr_scheduler,
+            sampler=None,
+            rank=0,
+            world_size=1):
         self.model = model
         self.train_loader = train_loader
         self.optimizer = optimizer
         self.device = device
         self.lr_scheduler = lr_scheduler
+        self.sampler = sampler
+        self.rank = rank
+        self.world_size = world_size
 
 # 实验函数配置
 STEP_MAP = {
@@ -519,7 +557,7 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters())
 
 @contextmanager
-def experiment_manager(experiment_config: ExperimentConfig):
+def experiment_manager(experiment_config: ExperimentConfig, rank=0, world_size=1):
     """管理GPU、数据集、模型资源，管理日志打印"""
     step_func_name = experiment_config.step_func_name
     optimizer_name = experiment_config.optimizer_name
@@ -535,22 +573,47 @@ def experiment_manager(experiment_config: ExperimentConfig):
     # 控制日志范围 logger.add新建一个sink，后续的info都会打印在这里
     timestamp = get_timestamp()
     logger.remove()
-    sink_id = logger.add(f"{log_file_path}/{timestamp}_train_{step_func_name}_{dataset_name}_{model_name}_{optimizer_name}_lr{lr}.log", mode="w", level="INFO")
+    if rank == 0:
+        sink_id = logger.add(
+            f"{log_file_path}/{timestamp}_train_{step_func_name}_{dataset_name}_{model_name}_{optimizer_name}_lr{lr}.log", 
+            mode="w", level="INFO"
+        )
+    else:
+        # 其他进程只记录错误到独立文件
+        sink_id = logger.add(
+            f"{log_file_path}/{timestamp}_rank{rank}_{step_func_name}.log", 
+            mode="w", level="ERROR"
+        )
+
     # 初始化所有资源
-    model, train_loader = get_model_and_dataloader(
-        model_name, dataset_name, experiment_config.hidden_size, max_position_embeddings=max_position_embeddings, max_length=max_length
+    model, train_loader, sampler = get_model_and_dataloader(
+        model_name, dataset_name, experiment_config.hidden_size, max_position_embeddings=max_position_embeddings,
+        max_length=max_length, rank=rank, world_size=world_size
     )
 
     total_params = count_parameters(model)
-    logger.info(f"🚀 开始实验: {optimizer_name}_{step_func_name}")
-    logger.info(f"目标损失阈值: {loss_threshold}, 最大epoch数: {max_epochs}, 总参数量: {total_params}"
-                "max_position_embeddings: {max_position_embeddings}, max_length:{max_length}")
+    # 只在主进程显示启动信息
+    if rank == 0:
+        logger.info(f"🚀 开始实验: {optimizer_name}_{step_func_name}")
+        logger.info(f"目标损失阈值: {loss_threshold}, 最大epoch数: {max_epochs}, 总参数量: {total_params}"
+                    "max_position_embeddings: {max_position_embeddings}, max_length:{max_length}")
+        logger.info(f"使用DDP训练，检测到 {world_size} 个GPU")
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
+     # DDP包装
+    if world_size > 1:
+        model = DDP(model, device_ids=[rank])
+    
+    # 获取优化器时需要注意：DDP包装后需要通过module访问原始模型
+    original_model = model.module if world_size > 1 else model
     optimizer = get_optimizer(
-        STEP_MAP.get(step_func_name).get("step_func"), optimizer_name, model, lr=lr, wd=experiment_config.wd
+        STEP_MAP.get(step_func_name).get("step_func"), 
+        optimizer_name, 
+        original_model, # 通过module访问原始模型
+        lr=lr, 
+        wd=experiment_config.wd
     )
     
     num_training_steps = len(train_loader) * max_epochs
@@ -567,16 +630,24 @@ def experiment_manager(experiment_config: ExperimentConfig):
         train_loader=train_loader,
         optimizer=optimizer,
         device=device,
-        lr_scheduler=lr_scheduler
+        lr_scheduler=lr_scheduler,
+        sampler=experiment_config.sampler,
+        rank=rank,
+        world_size=world_size
     )
     
     try:
-        logger.info("✅ 资源初始化完成")
+        if rank == 0:
+            logger.info("✅ 资源初始化完成")
         yield resources  # 在这里交出资源控制权
         
     finally:
         # 清理资源（无论正常还是异常都会执行）
-        logger.info("🧹 清理实验资源...")
+        if rank == 0:
+            logger.info("🧹 清理实验资源...")
+        # DDP清理
+        if world_size > 1:
+            cleanup_ddp()
         del resources.model
         del resources.train_loader
         del resources.optimizer
@@ -585,36 +656,61 @@ def experiment_manager(experiment_config: ExperimentConfig):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        logger.info("✅ 资源清理完成")
+        if rank == 0:
+            logger.info("✅ 资源清理完成")
         logger.remove(sink_id)
 
-def run_experiment(experiment_config: ExperimentConfig):
-    """运行单个实验，直到损失低于阈值或达到最大epoch数"""
-    with experiment_manager(experiment_config) as resources:
+# rank: 当前进程的排名（0, 1, 2, ...）
+# world_size: 总进程数（通常等于GPU数量）
+def setup_ddp(rank, world_size):
+    """初始化DDP进程组"""
+    dist.init_process_group("nccl", rank=rank, world_size=world_size) # 建立所有GPU进程间的通信连接,使用NVIDIA的NCCL后端，专门为GPU通信优化
+    torch.cuda.set_device(rank) # 设置当前进程使用的GPU设备
+
+def cleanup_ddp():
+    """清理DDP进程组"""
+    dist.destroy_process_group() # 清理进程组资源
+
+def broadcast_stop_signal(stop_training, rank):
+    """广播停止训练信号，确保所有进程同步停止"""
+    if dist.is_initialized(): # 检查distribute环境有没有初始化好
+        stop_tensor = torch.tensor([stop_training], device=f"cuda:{rank}") # 构建自己的stop_tensor，指定放在本device上面
+        dist.broadcast(stop_tensor, src=0) # source选择0号GPU,从那里获得stop_tensor,0号是什么其他就是什么
+        return stop_tensor.item() # 转换成bool类型
+    return stop_training
+
+def train_worker(rank, world_size, experiment_config):
+    """DDP训练工作进程"""
+    with experiment_manager(experiment_config, rank, world_size) as resources:
         model = resources.model
         train_loader = resources.train_loader
         optimizer = resources.optimizer
         device = resources.device
         lr_scheduler = resources.lr_scheduler
+        sampler = resources.sampler
         step_func_name = experiment_config.step_func_name
+        
         model.train()
         losses = []
-        
-        # 添加token计数器
         total_tokens_trained = 0
         batch_size = experiment_config.batch_size
         max_length = experiment_config.max_length
         
         for epoch in range(experiment_config.max_epochs):
+            # DDP重要：设置epoch以便shuffle正常工作
+            if sampler:
+                sampler.set_epoch(epoch)
+                
             epoch_losses = []
-            
-            # 创建epoch进度条
-            epoch_pbar = tqdm(
-                total=len(train_loader),
-                desc=f"Epoch {epoch+1}/{experiment_config.max_epochs} - {step_func_name}",
-                unit="batch",
-                ncols=100
-            )
+            stop_training = False
+            # 只在主进程显示进度条
+            if rank == 0:
+                epoch_pbar = tqdm(
+                    total=len(train_loader),
+                    desc=f"Epoch {epoch+1}/{experiment_config.max_epochs} - {step_func_name}",
+                    unit="batch",
+                    ncols=100
+                )
             
             for step, batch in enumerate(train_loader):
                 optimizer.zero_grad()
@@ -622,6 +718,8 @@ def run_experiment(experiment_config: ExperimentConfig):
                 input_ids = batch
                 outputs = model(input_ids=input_ids, labels=input_ids)
                 loss = outputs.loss
+                
+                # DDP自动维持所有GPU的平均值
                 loss.backward()
                 optimizer.step()
                 lr_scheduler.step()
@@ -633,34 +731,59 @@ def run_experiment(experiment_config: ExperimentConfig):
                 tokens_this_batch = batch_size * max_length
                 total_tokens_trained += tokens_this_batch
                 
-                # 更新进度条描述
-                epoch_pbar.set_postfix({
-                    'loss': f'{current_loss:.4f}',
-                    'tokens': f'{total_tokens_trained:,}',
-                    'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
-                })
-                epoch_pbar.update(1)
+                # 只在主进程更新进度条和日志
+                if rank == 0:
+                    epoch_pbar.set_postfix({
+                        'loss': f'{current_loss:.4f}',
+                        'tokens': f'{total_tokens_trained:,}',
+                        'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
+                    })
+                    epoch_pbar.update(1)
+                    
+                    if step % 100 == 0:
+                        logger.info(
+                            f"StepFunc: {step_func_name} Epoch: {epoch} Step: {step} Tokens: {total_tokens_trained} "
+                            f"LR: {optimizer.param_groups[0]['lr']:.6f} Loss: {current_loss:.4f}"
+                        )
+            
+            if rank == 0:
+                epoch_pbar.close()
                 
-                # 记录详细日志 - 改为token数对应loss
-                if step % 100 == 0:
-                    logger.info(
-                        f"StepFunc: {step_func_name} Epoch: {epoch} Step: {step} Tokens: {total_tokens_trained} "
-                        f"LR: {optimizer.param_groups[0]['lr']:.6f} Loss: {current_loss:.4f}"
-                    )
-            
-            epoch_pbar.close()
-            
-            # 计算epoch平均损失
-            avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
-            losses.append(avg_epoch_loss)
-            logger.info(f"📊 {step_func_name} - Epoch {epoch} 平均损失: {avg_epoch_loss:.4f}, 累计token数: {total_tokens_trained}")
-            
-            # 检查是否达到停止条件
-            if avg_epoch_loss < experiment_config.loss_threshold:
-                logger.info(f"🎯 {step_func_name} 已达到目标损失 {avg_epoch_loss:.4f} < {experiment_config.loss_threshold}, 停止训练")
+                # 计算epoch平均损失
+                avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
+                losses.append(avg_epoch_loss)
+                logger.info(f"📊 {step_func_name} - Epoch {epoch} 平均损失: {avg_epoch_loss:.4f}, 累计token数: {total_tokens_trained}")
+                
+                # 检查是否达到停止条件
+                if avg_epoch_loss < experiment_config.loss_threshold:
+                    stop_training = True
+                    logger.info(f"🎯 {step_func_name} 已达到目标损失 {avg_epoch_loss:.4f} < {experiment_config.loss_threshold}, 停止训练")
+                    break
+            # 关键修改：广播停止训练信号，确保所有进程同步停止
+            if world_size > 1:
+                stop_training = broadcast_stop_signal(stop_training, rank)
+            if stop_training:
                 break
+        
         final_loss = losses[-1] if losses else float('inf')
         return final_loss, losses
+
+def run_experiment(experiment_config: ExperimentConfig):
+    """运行单个实验，支持DDP"""
+    world_size = torch.cuda.device_count()
+    
+    if world_size > 1:
+        # 多GPU使用DDP
+        mp.spawn(
+            train_worker, # 目标函数
+            args=(world_size, experiment_config), #其他参数，rank会自动分配 0-world_size-1
+            nprocs=world_size,
+            join=True
+        )
+        return None, None
+    else:
+        # 单GPU直接调用训练函数
+        return train_worker(0, 1, experiment_config)
 
 def main():
     import argparse
@@ -671,7 +794,7 @@ def main():
     parser.add_argument("--optimizer", type=str, default="muon")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--wd", type=float, default=0.1)
-    parser.add_argument("--dataset", type=str, default="openwebtext-100k")
+    parser.add_argument("--dataset", type=str, default="openwebtext-local_txt")
     parser.add_argument("--hidden_size", type=int, default=512) # 一个词使用多长的向量来表示（词向量维数）
     parser.add_argument("--max_position_embeddings", type=int, default=2048) # 最长给多少个词编码
     parser.add_argument("--max_length", type=int, default=256) # 每一批样本读入多少个token（即词向量）
