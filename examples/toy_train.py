@@ -184,13 +184,14 @@ class Muon(torch.optim.Optimizer):
                 # calc update
                 state = self.state[p]
                 if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
+                    state["momentum_buffer"] = torch.zeros_like(g, device='cpu') # momentum初始化到cpu主存
+                buf = state["momentum_buffer"].to(p.device)
                 buf.mul_(momentum).add_(g)
                 if group["nesterov"]:
                     g = g.add(buf, alpha=momentum)
                 else:
                     g = buf
+                state["momentum_buffer"] = buf.cpu()
                 u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
 
                 # scale update
