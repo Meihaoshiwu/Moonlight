@@ -1,2 +1,69 @@
-logs
-*.bin
+# 虚拟环境目录
+venv/
+env/
+.venv/
+ENV/
+
+# Python 编译缓存文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# 打包和发布目录
+dist/
+build/
+*.egg-info/
+
+# PyInstaller 输出
+*.exe
+
+# 单元测试和代码覆盖率报告
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# 环境变量文件（非常重要！切勿提交密钥）
+.env
+.env.local
+.env.production
+
+# VSCode 配置文件
+.vscode/
+*code-workspace
+
+# 操作系统生成的文件
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE 配置文件
+# PyCharm
+.idea/
+*.iws
+*.iml
+*.ipr
+
+# 由 pyenv 或类似工具创建的 Python 解释器目录
+.python-version
+
+# 日志文件
+*.log
+logs/
+
+# 数据库文件（如果是 SQLite）
+*.db
+*.sqlite3
+
+# 临时文件
+*.tmp
+*.temp
